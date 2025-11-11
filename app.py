@@ -7,20 +7,49 @@ import numpy as np
 from PIL import Image
 import io
 import os
+import gc
 
-# Force CPU usage for compatibility
-os.environ["CUDA_VISIBLE_DEVICES"] = "-1"
+# MEMORY OPTIMIZATION: Reduce TensorFlow memory usage
+os.environ['TF_CPP_MIN_LOG_LEVEL'] = '3'  # Suppress TF logs
+os.environ['CUDA_VISIBLE_DEVICES'] = '-1'  # Force CPU only
 
-# Lifespan context manager (replaces deprecated on_event)
+# Configure TensorFlow to use less memory
+gpus = tf.config.experimental.list_physical_devices('GPU')
+if gpus:
+    try:
+        for gpu in gpus:
+            tf.config.experimental.set_memory_growth(gpu, True)
+    except RuntimeError as e:
+        print(e)
+
+# Global variable for model
+model = None
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    # Startup
+    # Startup - load model
+    global model
     print("🚀 Loading Keras model...")
-    app.state.model = tf.keras.models.load_model('final_model.keras')
+    
+    # MEMORY OPTIMIZATION: Clear any existing TensorFlow graphs
+    tf.keras.backend.clear_session()
+    gc.collect()
+    
+    # Load model with optimizations
+    model = tf.keras.models.load_model(
+        'final_model.keras',
+        compile=False  # MEMORY OPTIMIZATION: Don't compile (we're only doing inference)
+    )
     print("✅ Model loaded successfully!")
+    
     yield
-    # Shutdown (if needed)
+    
+    # Shutdown - cleanup
     print("👋 Shutting down...")
+    if model is not None:
+        del model
+    tf.keras.backend.clear_session()
+    gc.collect()
 
 app = FastAPI(title="Screen Recapture Detection", lifespan=lifespan)
 
@@ -32,7 +61,6 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# Simple home page
 @app.get("/", response_class=HTMLResponse)
 def home():
     return """
@@ -46,9 +74,14 @@ def home():
                 .result { margin: 20px 0; padding: 15px; border-radius: 5px; }
                 .original { background: #d4edda; color: #155724; }
                 .recaptured { background: #f8d7da; color: #721c24; }
+                .warning { background: #fff3cd; color: #856404; padding: 10px; border-radius: 5px; }
             </style>
         </head>
         <body>
+            <div class="warning">
+                <strong>Note:</strong> This is a memory-optimized version. If you get errors, the service may be restarting due to memory limits.
+            </div>
+            
             <h1>📸 Screen Recapture Detection</h1>
             <p>Upload an image to detect if it's original or recaptured from a screen</p>
             
@@ -69,14 +102,20 @@ def home():
                     const formData = new FormData();
                     formData.append('file', fileInput.files[0]);
                     
+                    const resultDiv = document.getElementById('result');
+                    resultDiv.innerHTML = '<div class="result">Processing... Please wait.</div>';
+                    
                     try {
                         const response = await fetch('/predict', {
                             method: 'POST',
                             body: formData
                         });
                         
+                        if (!response.ok) {
+                            throw new Error(`HTTP error! status: ${response.status}`);
+                        }
+                        
                         const data = await response.json();
-                        const resultDiv = document.getElementById('result');
                         
                         if (data.success) {
                             const label = data.prediction.label;
@@ -95,9 +134,10 @@ def home():
                             </div>`;
                         }
                     } catch (error) {
-                        document.getElementById('result').innerHTML = `
+                        resultDiv.innerHTML = `
                             <div class="result" style="background: #f8d7da; color: #721c24;">
-                                <p>Network error: ${error.message}</p>
+                                <p>Error: ${error.message}</p>
+                                <p>This might be due to memory limits. Try again in a moment.</p>
                             </div>`;
                     }
                 });
@@ -106,25 +146,34 @@ def home():
     </html>
     """
 
-# Prediction endpoint
 @app.post("/predict")
 async def predict(file: UploadFile = File(...)):
+    global model
+    
+    if model is None:
+        raise HTTPException(status_code=503, detail="Model not loaded. Service may be restarting.")
+    
     # Validate file type
     if not file.content_type.startswith('image/'):
         raise HTTPException(status_code=400, detail="Please upload an image file")
     
     try:
-        # Read and process image
+        # MEMORY OPTIMIZATION: Process smaller images
         contents = await file.read()
         img = Image.open(io.BytesIO(contents)).convert('RGB')
         
-        # Preprocess image (adjust size based on your model's requirements)
-        img = img.resize((224, 224))  # Change this if your model expects different size
-        img_array = np.array(img) / 255.0  # Normalize to [0,1]
-        img_array = np.expand_dims(img_array, axis=0)  # Add batch dimension
+        # Resize to smaller dimensions to save memory
+        img = img.resize((150, 150))  # Reduced from 224x224
         
-        # Make prediction
-        prediction = app.state.model.predict(img_array, verbose=0)[0][0]
+        img_array = np.array(img) / 255.0
+        img_array = np.expand_dims(img_array, axis=0)
+        
+        # Predict
+        prediction = model.predict(img_array, verbose=0)[0][0]
+        
+        # MEMORY OPTIMIZATION: Clean up
+        del img_array
+        gc.collect()
         
         # Interpret results
         is_recaptured = prediction > 0.5
@@ -143,16 +192,15 @@ async def predict(file: UploadFile = File(...)):
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Prediction failed: {str(e)}")
 
-# Health check
 @app.get("/health")
 async def health():
-    model_loaded = hasattr(app.state, 'model') and app.state.model is not None
+    global model
     return {
-        "status": "healthy", 
-        "model_loaded": model_loaded,
-        "message": "Screen Recapture Detection API is running!"
+        "status": "healthy" if model is not None else "restarting",
+        "model_loaded": model is not None,
+        "message": "Screen Recapture Detection API"
     }
 
 if __name__ == "__main__":
     import uvicorn
-    uvicorn.run(app, host="0.0.0.0", port=8000)
+    uvicorn.run("app:app", host="0.0.0.0", port=8000, workers=1)  # Single worker to save memory
