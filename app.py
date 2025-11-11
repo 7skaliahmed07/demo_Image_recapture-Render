@@ -1,40 +1,35 @@
 from fastapi import FastAPI, UploadFile, File, HTTPException
 from fastapi.responses import HTMLResponse
-import onnxruntime as ort
+import tensorflow as tf
 import numpy as np
 from PIL import Image
 import io
 import os
+import gc
 
-# Ultra-lightweight - no TensorFlow!
-os.environ['OMP_NUM_THREADS'] = '1'  # Reduce memory usage
+# AGGRESSIVE MEMORY OPTIMIZATION
+os.environ['TF_CPP_MIN_LOG_LEVEL'] = '3'
+os.environ['CUDA_VISIBLE_DEVICES'] = '-1'
+os.environ['TF_FORCE_GPU_ALLOW_GROWTH'] = 'true'
 
-# Global session
-session = None
+# Configure TensorFlow to use minimal memory
+tf.config.threading.set_intra_op_parallelism_threads(1)
+tf.config.threading.set_inter_op_parallelism_threads(1)
 
 app = FastAPI(title="Screen Recapture Detection")
 
 @app.on_event("startup")
 async def startup_event():
-    global session
-    print("🚀 Loading ONNX model...")
+    print("🚀 Loading TensorFlow Lite model...")
     try:
-        # Use minimal session options
-        options = ort.SessionOptions()
-        options.intra_op_num_threads = 1
-        options.inter_op_num_threads = 1
-        
-        session = ort.InferenceSession(
-            "model.onnx",
-            sess_options=options,
-            providers=['CPUExecutionProvider']  # CPU only
-        )
-        print("✅ ONNX model loaded successfully!")
-        print(f"📊 Input: {session.get_inputs()[0].name}")
-        print(f"📊 Output: {session.get_outputs()[0].name}")
+        # Use existing TFLite model
+        app.state.interpreter = tf.lite.Interpreter(model_path="model.tflite")
+        app.state.interpreter.allocate_tensors()
+        app.state.input_details = app.state.interpreter.get_input_details()
+        app.state.output_details = app.state.interpreter.get_output_details()
+        print("✅ Model loaded successfully!")
     except Exception as e:
         print(f"❌ Error: {e}")
-        raise
 
 @app.get("/")
 async def home():
@@ -100,42 +95,49 @@ async def home():
 
 @app.post("/predict")
 async def predict(file: UploadFile = File(...)):
-    global session
-    
-    if session is None:
+    if not hasattr(app.state, 'interpreter'):
         raise HTTPException(503, "Service starting...")
     
     try:
-        # Read and process image
+        # Read image with size limit
         contents = await file.read()
+        if len(contents) > 5 * 1024 * 1024:  # 5MB limit
+            raise HTTPException(400, "Image too large (max 5MB)")
+            
         img = Image.open(io.BytesIO(contents)).convert('RGB')
-        img = img.resize((224, 224))
+        img = img.resize((150, 150))  # Smaller size for less memory
         
-        # Convert to numpy array and normalize
+        # Convert to numpy array
         img_array = np.array(img, dtype=np.float32) / 255.0
         img_array = np.expand_dims(img_array, axis=0)
         
-        # Run inference with ONNX
-        input_name = session.get_inputs()[0].name
-        output_name = session.get_outputs()[0].name
-        prediction = session.run([output_name], {input_name: img_array})[0][0][0]
+        # Run inference
+        interpreter = app.state.interpreter
+        interpreter.set_tensor(interpreter.get_input_details()[0]['index'], img_array)
+        interpreter.invoke()
+        prediction = interpreter.get_tensor(interpreter.get_output_details()[0]['index'])[0][0]
         
-        # Interpret results
+        # Clean up memory immediately
+        del img_array
+        gc.collect()
+        
+        # Return result
         is_recaptured = prediction > 0.5
         label = "Recaptured Image" if is_recaptured else "Original Image"
         confidence = float(prediction if is_recaptured else 1 - prediction)
         
         return {
             "success": True,
-            "prediction": {"label": label, "confidence": confidence, "raw_score": float(prediction)}
+            "prediction": {"label": label, "confidence": confidence}
         }
         
     except Exception as e:
+        gc.collect()
         raise HTTPException(500, f"Prediction failed: {str(e)}")
 
 @app.get("/health")
 async def health():
-    return {"status": "healthy", "model_loaded": session is not None}
+    return {"status": "healthy", "model_loaded": hasattr(app.state, 'interpreter')}
 
 if __name__ == "__main__":
     import uvicorn
