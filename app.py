@@ -27,23 +27,29 @@ def predict(image):
         interpreter.invoke()
         prediction = interpreter.get_tensor(output_details[0]['index'])[0][0]
         
-        # Format results
+        # Format results - FIXED: No dropdown, clean output
         is_recaptured = prediction > 0.5
         label = "🖥️ Recaptured Image" if is_recaptured else "📷 Original Image"
         confidence = prediction if is_recaptured else 1 - prediction
         
-        return f"{label}\nConfidence: {confidence:.1%}"
+        # Clean single line output without dropdown
+        result_text = f"**{label}**\nConfidence: {confidence:.1%}"
+        return result_text
         
     except Exception as e:
-        return f"Error: {str(e)}"
+        return f"❌ Error: {str(e)}"
 
-# Create interface
+# Create interface - FIXED: Remove problematic components
 demo = gr.Interface(
     fn=predict,
-    inputs=gr.Image(type="pil", label="Upload Image"),
-    outputs=gr.Textbox(label="Result"),
+    inputs=gr.Image(type="pil", label="📁 Upload Image"),
+    outputs=gr.Textbox(
+        label="🎯 Detection Result",
+        show_copy_button=True  # Better UX
+    ),
     title="📸 Screen Recapture Detection",
-    description="Upload an image to detect if it's original or recaptured from a screen"
+    description="Upload an image to detect if it's original or recaptured from a screen",
+    allow_flagging="never"  # Remove the flagging dropdown
 )
 
-demo.launch()
+demo.launch(show_api=False)  # Cleaner interface
